@@ -220,6 +220,8 @@ strings! {
     MoveDown => ("Ниже", "Move down"),
     DeleteBlock => ("Удалить блок", "Delete block"),
     HeadingLevel => ("Уровень", "Heading level"),
+    TurnInto => ("Превратить в…", "Turn into…"),
+    EditNote => ("Редактировать", "Edit note"),
     PlaceholderParagraph => ("Пишите. Markdown-lite: **жирный**, *курсив*, `код`, [[ссылка]].", "Write. Markdown-lite: **bold**, *italic*, `code`, [[link]]."),
     PlaceholderHeading => ("Заголовок", "Heading"),
     PlaceholderCode => ("Код без выполнения", "Code, never executed"),

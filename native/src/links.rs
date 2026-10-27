@@ -20,6 +20,145 @@ pub struct LinkSpan {
     pub target: String,
 }
 
+/// Rich inline markdown token kinds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InlineKind {
+    Bold,
+    Italic,
+    Code,
+    WikiLink,
+    ExternalLink { label_len: usize },
+}
+
+/// One parsed inline formatting token: byte range, delimiter length, and token kind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineSpan {
+    pub start: usize,
+    pub end: usize,
+    pub delim_len: usize,
+    pub kind: InlineKind,
+}
+
+/// Find every rich inline formatting span in `text` (bold, italic, code, wikilinks, urls).
+pub fn inline_spans(text: &str) -> Vec<InlineSpan> {
+    let mut spans = Vec::new();
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // 1. Wikilink: [[...]]
+        if i + 1 < len && bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            if let Some(close) = text[i + 2..].find("]]") {
+                let end = i + 2 + close + 2;
+                let raw = &text[i + 2..i + 2 + close];
+                if !raw.contains('[') && !raw.contains(']') && !raw.trim().is_empty() {
+                    spans.push(InlineSpan {
+                        start: i,
+                        end,
+                        delim_len: 2,
+                        kind: InlineKind::WikiLink,
+                    });
+                    i = end;
+                    continue;
+                }
+            }
+        }
+
+        // 2. Inline code: `...`
+        if bytes[i] == b'`' {
+            if let Some(close) = text[i + 1..].find('`') {
+                let end = i + 1 + close + 1;
+                let raw = &text[i + 1..i + 1 + close];
+                if !raw.is_empty() && !raw.contains('\n') {
+                    spans.push(InlineSpan {
+                        start: i,
+                        end,
+                        delim_len: 1,
+                        kind: InlineKind::Code,
+                    });
+                    i = end;
+                    continue;
+                }
+            }
+        }
+
+        // 3. External link: [label](url)
+        if bytes[i] == b'[' {
+            if let Some(close_bracket) = text[i + 1..].find(']') {
+                let bracket_end = i + 1 + close_bracket;
+                if bracket_end + 1 < len && bytes[bracket_end + 1] == b'(' {
+                    if let Some(close_paren) = text[bracket_end + 2..].find(')') {
+                        let end = bracket_end + 2 + close_paren + 1;
+                        let label = &text[i + 1..bracket_end];
+                        let url = &text[bracket_end + 2..end - 1];
+                        if !label.is_empty() && !url.contains('\n') && !label.contains('\n') {
+                            spans.push(InlineSpan {
+                                start: i,
+                                end,
+                                delim_len: 1,
+                                kind: InlineKind::ExternalLink { label_len: label.len() },
+                            });
+                            i = end;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Bold: **...** or __...__
+        if (i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*')
+            || (i + 1 < len && bytes[i] == b'_' && bytes[i + 1] == b'_')
+        {
+            let marker = if bytes[i] == b'*' { "**" } else { "__" };
+            if let Some(close) = text[i + 2..].find(marker) {
+                let end = i + 2 + close + 2;
+                let inner = &text[i + 2..i + 2 + close];
+                if !inner.is_empty() && !inner.trim().is_empty() && !inner.contains('\n') {
+                    spans.push(InlineSpan {
+                        start: i,
+                        end,
+                        delim_len: 2,
+                        kind: InlineKind::Bold,
+                    });
+                    i = end;
+                    continue;
+                }
+            }
+        }
+
+        // 5. Italic: *...* or _..._
+        if bytes[i] == b'*' || bytes[i] == b'_' {
+            let marker_char = bytes[i] as char;
+            if i + 1 < len && bytes[i + 1] != b' ' && bytes[i + 1] != b'\t' && bytes[i + 1] != bytes[i] {
+                if let Some(close) = text[i + 1..].find(marker_char) {
+                    let end = i + 1 + close + 1;
+                    let inner = &text[i + 1..i + 1 + close];
+                    if !inner.is_empty() && !inner.ends_with(' ') && !inner.contains('\n') && !inner.contains(marker_char) {
+                        spans.push(InlineSpan {
+                            start: i,
+                            end,
+                            delim_len: 1,
+                            kind: InlineKind::Italic,
+                        });
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if let Some(ch) = text[i..].chars().next() {
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
+    }
+
+    spans
+}
+
 /// Find every `[[target]]` span in `text`.
 ///
 /// Unclosed `[[`, empty `[[ ]]` and nested brackets are ignored: a half-typed
@@ -166,31 +305,199 @@ pub fn backlinks(capsules: &[Capsule], index: usize) -> Vec<usize> {
     found
 }
 
-/// Lay out paragraph text with every `[[link]]` painted in the accent colour
-/// and underlined, so the syntax is visible before it is clicked. Used as the
-/// `TextEdit` layouter: the bytes stay plain text and only the glyph run
-/// changes.
+/// Lay out text with rich markdown formatting (bold, italic, code, wikilinks, urls)
+/// rendered inline with subtle delimiter styling so the document looks formatted
+/// immediately while remaining 100% byte-exact for editing.
 pub fn layout(ui: &egui::Ui, text: &str, size: f32, wrap: f32) -> std::sync::Arc<egui::Galley> {
     let font = egui::FontId::new(size, egui::FontFamily::Proportional);
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap;
     let mut cursor = 0usize;
-    for span in spans(text) {
+
+    let ghost_color = theme::fade(theme::FAINT, 0.22);
+    let ghost_delim_font = egui::FontId::new(size * 0.85, egui::FontFamily::Proportional);
+
+    for span in inline_spans(text) {
         if span.start > cursor {
             job.append(&text[cursor..span.start], 0.0, plain(&font));
         }
-        job.append(
-            &text[span.start..span.end],
-            0.0,
-            egui::TextFormat {
-                font_id: font.clone(),
-                color: theme::ACCENT_INK,
-                underline: egui::Stroke::new(1.0, theme::ACCENT),
-                ..Default::default()
-            },
-        );
+
+        match span.kind {
+            InlineKind::WikiLink => {
+                // Opening [[
+                job.append(
+                    &text[span.start..span.start + 2],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: ghost_delim_font.clone(),
+                        color: theme::fade(theme::ACCENT, 0.4),
+                        ..Default::default()
+                    },
+                );
+                // Inner target
+                job.append(
+                    &text[span.start + 2..span.end - 2],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: font.clone(),
+                        color: theme::ACCENT_INK,
+                        underline: egui::Stroke::new(1.0, theme::ACCENT),
+                        ..Default::default()
+                    },
+                );
+                // Closing ]]
+                job.append(
+                    &text[span.end - 2..span.end],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: ghost_delim_font.clone(),
+                        color: theme::fade(theme::ACCENT, 0.4),
+                        ..Default::default()
+                    },
+                );
+            }
+            InlineKind::Bold => {
+                job.append(
+                    &text[span.start..span.start + span.delim_len],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: ghost_delim_font.clone(),
+                        color: ghost_color,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &text[span.start + span.delim_len..span.end - span.delim_len],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::new(size, theme::semibold()),
+                        color: theme::INK,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &text[span.end - span.delim_len..span.end],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: ghost_delim_font.clone(),
+                        color: ghost_color,
+                        ..Default::default()
+                    },
+                );
+            }
+            InlineKind::Italic => {
+                job.append(
+                    &text[span.start..span.start + span.delim_len],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: ghost_delim_font.clone(),
+                        color: ghost_color,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &text[span.start + span.delim_len..span.end - span.delim_len],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: font.clone(),
+                        italics: true,
+                        color: theme::INK,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &text[span.end - span.delim_len..span.end],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: ghost_delim_font.clone(),
+                        color: ghost_color,
+                        ..Default::default()
+                    },
+                );
+            }
+            InlineKind::Code => {
+                job.append(
+                    &text[span.start..span.start + 1],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::new(size * 0.85, theme::mono()),
+                        color: ghost_color,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &text[span.start + 1..span.end - 1],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::new(size * 0.9, theme::mono()),
+                        color: theme::ACCENT_INK,
+                        background: theme::SUNKEN,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &text[span.end - 1..span.end],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::new(size * 0.85, theme::mono()),
+                        color: ghost_color,
+                        ..Default::default()
+                    },
+                );
+            }
+            InlineKind::ExternalLink { label_len } => {
+                job.append(
+                    &text[span.start..span.start + 1],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: ghost_delim_font.clone(),
+                        color: ghost_color,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &text[span.start + 1..span.start + 1 + label_len],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: font.clone(),
+                        color: theme::ACCENT_INK,
+                        underline: egui::Stroke::new(1.0, theme::ACCENT),
+                        ..Default::default()
+                    },
+                );
+                let mid_start = span.start + 1 + label_len;
+                job.append(
+                    &text[mid_start..mid_start + 2],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: ghost_delim_font.clone(),
+                        color: ghost_color,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &text[mid_start + 2..span.end - 1],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::new(size * 0.85, theme::mono()),
+                        color: theme::fade(theme::FAINT, 0.5),
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &text[span.end - 1..span.end],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: ghost_delim_font.clone(),
+                        color: ghost_color,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
         cursor = span.end;
     }
+
     if cursor < text.len() || text.is_empty() {
         job.append(&text[cursor.min(text.len())..], 0.0, plain(&font));
     }
@@ -415,5 +722,37 @@ mod tests {
         assert_eq!(backlinks(&capsules, 0), vec![1]);
         assert_eq!(resolve("fresh", &capsules), Some(0));
         assert_eq!(resolve("old", &capsules), None);
+    }
+
+    #[test]
+    fn test_inline_spans_detection() {
+        let text = "Text with **bold**, *italic*, `code`, [[wiki]] and [site](https://test.com).";
+        let spans = inline_spans(text);
+        assert_eq!(spans.len(), 5);
+
+        assert_eq!(spans[0].kind, InlineKind::Bold);
+        assert_eq!(&text[spans[0].start..spans[0].end], "**bold**");
+
+        assert_eq!(spans[1].kind, InlineKind::Italic);
+        assert_eq!(&text[spans[1].start..spans[1].end], "*italic*");
+
+        assert_eq!(spans[2].kind, InlineKind::Code);
+        assert_eq!(&text[spans[2].start..spans[2].end], "`code`");
+
+        assert_eq!(spans[3].kind, InlineKind::WikiLink);
+        assert_eq!(&text[spans[3].start..spans[3].end], "[[wiki]]");
+
+        assert!(matches!(spans[4].kind, InlineKind::ExternalLink { .. }));
+        assert_eq!(&text[spans[4].start..spans[4].end], "[site](https://test.com)");
+    }
+
+    #[test]
+    fn test_inline_spans_cyrillic() {
+        let text = "Пишите **жирный** текст, *курсив* и `код`.";
+        let spans = inline_spans(text);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(&text[spans[0].start..spans[0].end], "**жирный**");
+        assert_eq!(&text[spans[1].start..spans[1].end], "*курсив*");
+        assert_eq!(&text[spans[2].start..spans[2].end], "`код`");
     }
 }

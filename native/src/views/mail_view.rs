@@ -378,14 +378,9 @@ fn native_body(ui: &mut Ui, capsule: &Capsule, locale: Locale) {
                 ui.add_space(4.0);
             }
             "paragraph" => {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(crate::mime::block_data_text(block))
-                            .size(13.5)
-                            .color(theme::INK),
-                    )
-                    .wrap(),
-                );
+                let text = crate::mime::block_data_text(block);
+                let galley = crate::links::layout(ui, &text, 13.5, ui.available_width());
+                ui.label(galley);
                 ui.add_space(9.0);
             }
             "callout" => {
@@ -425,16 +420,66 @@ fn native_body(ui: &mut Ui, capsule: &Capsule, locale: Locale) {
                                 RichText::new(title)
                                     .family(theme::semibold())
                                     .size(12.5)
-                                    .color(theme::INK),
+                                    .color(accent),
                             );
                             ui.add_space(3.0);
                         }
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(content).size(12.5).color(theme::MUTED),
-                            )
-                            .wrap(),
-                        );
+                        let wrap_width = ui.available_width();
+                        for line in content.lines() {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                ui.add_space(3.0);
+                                continue;
+                            }
+                            if trimmed.starts_with("### ") {
+                                ui.add_space(5.0);
+                                ui.label(
+                                    RichText::new(&trimmed[4..])
+                                        .font(egui::FontId::new(13.0, theme::semibold()))
+                                        .color(theme::INK),
+                                );
+                            } else if trimmed.starts_with("## ") {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(&trimmed[3..])
+                                        .font(egui::FontId::new(14.0, theme::semibold()))
+                                        .color(theme::INK),
+                                );
+                            } else if let Some(dot_pos) = trimmed.find(". ") {
+                                if trimmed[..dot_pos].chars().all(|c| c.is_ascii_digit()) && dot_pos <= 3 {
+                                    let num = &trimmed[..dot_pos];
+                                    let rest = trimmed[dot_pos + 2..].trim();
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(2.0);
+                                        ui.label(
+                                            RichText::new(format!("{num}."))
+                                                .font(egui::FontId::new(11.0, theme::mono()))
+                                                .color(accent),
+                                        );
+                                        let galley = crate::links::layout(ui, rest, 12.5, wrap_width - 24.0);
+                                        ui.label(galley);
+                                    });
+                                } else {
+                                    let galley = crate::links::layout(ui, line, 12.5, wrap_width);
+                                    ui.label(galley);
+                                }
+                            } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                                let rest = trimmed[2..].trim();
+                                ui.horizontal(|ui| {
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        RichText::new("•")
+                                            .font(egui::FontId::new(12.5, theme::semibold()))
+                                            .color(accent),
+                                    );
+                                    let galley = crate::links::layout(ui, rest, 12.5, wrap_width - 20.0);
+                                    ui.label(galley);
+                                });
+                            } else {
+                                let galley = crate::links::layout(ui, line, 12.5, wrap_width);
+                                ui.label(galley);
+                            }
+                        }
                     });
                 ui.painter().rect_filled(
                     egui::Rect::from_min_size(

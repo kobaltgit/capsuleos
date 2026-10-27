@@ -27,6 +27,7 @@ mod mail;
 mod mcp;
 mod mime;
 mod planning;
+mod rich_text;
 mod search;
 mod snapshot;
 mod theme;
@@ -3910,6 +3911,12 @@ fn draw_document(
                                             action.changed = true;
                                         }
                                     }
+                                    BlockOp::TransformTo(target) => {
+                                        if let Some(block) = capsule.blocks.get_mut(index) {
+                                            transform_block(block, target, locale);
+                                            action.changed = true;
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -4340,6 +4347,59 @@ enum BlockOp {
     Down,
     Delete,
     SetLevel(u8),
+    TransformTo(BlockKind),
+}
+
+fn transform_block(block: &mut Value, target: BlockKind, locale: Locale) {
+    let text = block_data_text(block);
+    let id = block.get("id").and_then(Value::as_str).unwrap_or("blk").to_string();
+    *block = match target {
+        BlockKind::Text => json!({
+            "id": id,
+            "type": "paragraph",
+            "data": { "text": text }
+        }),
+        BlockKind::Heading => json!({
+            "id": id,
+            "type": "heading",
+            "data": { "level": 2, "text": text }
+        }),
+        BlockKind::Tasks => json!({
+            "id": id,
+            "type": "todo_list",
+            "data": {
+                "title": "",
+                "items": if text.is_empty() {
+                    vec![]
+                } else {
+                    vec![json!({
+                        "id": "task_0",
+                        "text": text,
+                        "done": false,
+                        "status": "todo"
+                    })]
+                }
+            }
+        }),
+        BlockKind::Callout => json!({
+            "id": id,
+            "type": "callout",
+            "data": {
+                "title": t(locale, Key::BlockCallout),
+                "content": text,
+                "tone": "emerald"
+            }
+        }),
+        BlockKind::Code => json!({
+            "id": id,
+            "type": "code_repl",
+            "data": {
+                "language": "text",
+                "code": text
+            }
+        }),
+        _ => return,
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -4475,7 +4535,7 @@ fn draw_block_row(
                     ui.add_space(GUTTER);
                     ui.vertical(|ui| {
                         ui.set_max_width(ui.available_width());
-                        changed = draw_block_content(ui, block, &kind, attachments, locale);
+                        changed = draw_block_content(ui, block, &kind, attachments, locale, &mut op);
                     });
                 });
             },
@@ -4539,6 +4599,26 @@ fn draw_block_row(
             } else {
                 menu_header(ui, &kind.replace('_', " "));
             }
+
+            // Turn into... block type selector
+            menu_header(ui, t(locale, Key::TurnInto));
+            if menu_row(ui, Some(Icon::Doc), t(locale, Key::BlockParagraph), None, false, kind != "paragraph", false).clicked() {
+                op = Some(BlockOp::TransformTo(BlockKind::Text));
+            }
+            if menu_row(ui, Some(Icon::Command), t(locale, Key::BlockHeading), None, false, kind != "heading", false).clicked() {
+                op = Some(BlockOp::TransformTo(BlockKind::Heading));
+            }
+            if menu_row(ui, Some(Icon::Check), t(locale, Key::BlockTodo), None, false, kind != "todo_list", false).clicked() {
+                op = Some(BlockOp::TransformTo(BlockKind::Tasks));
+            }
+            if menu_row(ui, Some(Icon::Info), t(locale, Key::BlockCallout), None, false, kind != "callout", false).clicked() {
+                op = Some(BlockOp::TransformTo(BlockKind::Callout));
+            }
+            if menu_row(ui, Some(Icon::Code), t(locale, Key::BlockCode), None, false, kind != "code_repl", false).clicked() {
+                op = Some(BlockOp::TransformTo(BlockKind::Code));
+            }
+
+            menu_separator(ui);
             if menu_row(
                 ui,
                 Some(Icon::ArrowUp),
@@ -4590,6 +4670,7 @@ fn draw_block_content(
     kind: &str,
     attachments: &mut [Attachment],
     locale: Locale,
+    op: &mut Option<BlockOp>,
 ) -> bool {
     match kind {
         "heading" => {
@@ -4628,18 +4709,208 @@ fn draw_block_content(
             let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap: f32| {
                 links::layout(ui, buffer.as_str(), 15.5, wrap)
             };
-            let response = ui.add(
-                TextEdit::multiline(&mut text)
-                    .font(FontId::new(15.5, FontFamily::Proportional))
-                    .text_color(theme::INK)
-                    .frame(Frame::NONE)
-                    .margin(Margin::same(0))
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(rows)
-                    .layouter(&mut layouter)
-                    .hint_text(t(locale, Key::PlaceholderParagraph)),
-            );
+            let output = TextEdit::multiline(&mut text)
+                .font(FontId::new(15.5, FontFamily::Proportional))
+                .text_color(theme::INK)
+                .frame(Frame::NONE)
+                .margin(Margin::same(0))
+                .desired_width(f32::INFINITY)
+                .desired_rows(rows)
+                .layouter(&mut layouter)
+                .hint_text(t(locale, Key::PlaceholderParagraph))
+                .show(ui);
+            let response = output.response.response;
+
+            let has_focus = response.has_focus();
+            let sel_key = response.id.with("saved-selection");
+
+            // If TextEdit has focus, check if user selected text
+            if has_focus {
+                if let Some(cursor_range) = output.cursor_range {
+                    let p_idx = cursor_range.primary.index;
+                    let s_idx = cursor_range.secondary.index;
+                    if p_idx != s_idx {
+                        let c_min: usize = p_idx.min(s_idx).into();
+                        let c_max: usize = p_idx.max(s_idx).into();
+                        let (b_start, b_end) = rich_text::char_range_to_byte_range(&text, c_min, c_max);
+                        if b_start < b_end && b_end <= text.len() {
+                            let r1 = output.galley.pos_from_cursor(cursor_range.primary);
+                            let r2 = output.galley.pos_from_cursor(cursor_range.secondary);
+                            let sel_rect = r1.union(r2).translate(output.galley_pos.to_vec2());
+                            ui.data_mut(|d| {
+                                d.insert_temp(sel_key, rich_text::SavedSelection::new(sel_rect, b_start, b_end));
+                            });
+                        }
+                    } else {
+                        // If cursor is just a single point and not a selection, clear toolbar
+                        ui.data_mut(|d| d.remove_temp::<rich_text::SavedSelection>(sel_key));
+                    }
+                }
+            }
+
+            let saved_selection = ui.data(|d| d.get_temp::<rich_text::SavedSelection>(sel_key));
+            let bubble_id = response.id.with("floating-bubble-menu");
+            let bubble_rect = rich_text::toolbar_rect(ui, bubble_id);
+
+            // Clear saved selection if user clicks outside both TextEdit and the toolbar
+            if ui.input(|i| i.pointer.any_pressed()) {
+                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                    let in_text_edit = response.rect.contains(pos);
+                    let in_toolbar = bubble_rect.map_or(false, |r| r.contains(pos));
+                    if !in_text_edit && !in_toolbar {
+                        ui.data_mut(|d| d.remove_temp::<rich_text::SavedSelection>(sel_key));
+                    }
+                }
+            }
+
+            // Keyboard hotkeys when focused on selection:
+            if has_focus {
+                if let Some(saved) = saved_selection {
+                    let (b_start, b_end) = (saved.b_start, saved.b_end);
+                    if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::B)) {
+                        let (ns, ne) = rich_text::toggle_wrap(&mut text, b_start, b_end, "**", "**");
+                        set_block_text(block, text.clone());
+                        ui.data_mut(|d| d.insert_temp(sel_key, rich_text::SavedSelection::new(saved.rect(), ns, ne)));
+                        return true;
+                    } else if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::I)) {
+                        let (ns, ne) = rich_text::toggle_wrap(&mut text, b_start, b_end, "*", "*");
+                        set_block_text(block, text.clone());
+                        ui.data_mut(|d| d.insert_temp(sel_key, rich_text::SavedSelection::new(saved.rect(), ns, ne)));
+                        return true;
+                    } else if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
+                        let (ns, ne) = rich_text::toggle_wrap(&mut text, b_start, b_end, "[[", "]]");
+                        set_block_text(block, text.clone());
+                        ui.data_mut(|d| d.insert_temp(sel_key, rich_text::SavedSelection::new(saved.rect(), ns, ne)));
+                        return true;
+                    }
+                }
+            }
+
+            // Floating Bubble toolbar: show as long as saved_selection exists!
+            if let Some(saved) = saved_selection {
+                let anchor_rect = saved.rect();
+                let (b_start, b_end) = (saved.b_start, saved.b_end);
+                if let Some(action) = rich_text::draw_bubble_toolbar(ui, bubble_id, anchor_rect, locale) {
+                    match action {
+                        rich_text::BubbleAction::FormatBold => {
+                            let (ns, ne) = rich_text::toggle_wrap(&mut text, b_start, b_end, "**", "**");
+                            set_block_text(block, text.clone());
+                            ui.data_mut(|d| d.insert_temp(sel_key, rich_text::SavedSelection::new(anchor_rect, ns, ne)));
+                            ui.ctx().memory_mut(|m| m.request_focus(response.id));
+                            if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), response.id) {
+                                let c_start = text[..ns].chars().count();
+                                let c_end = text[..ne].chars().count();
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(c_start),
+                                    egui::text::CCursor::new(c_end),
+                                )));
+                                state.store(ui.ctx(), response.id);
+                            }
+                            return true;
+                        }
+                        rich_text::BubbleAction::FormatItalic => {
+                            let (ns, ne) = rich_text::toggle_wrap(&mut text, b_start, b_end, "*", "*");
+                            set_block_text(block, text.clone());
+                            ui.data_mut(|d| d.insert_temp(sel_key, rich_text::SavedSelection::new(anchor_rect, ns, ne)));
+                            ui.ctx().memory_mut(|m| m.request_focus(response.id));
+                            if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), response.id) {
+                                let c_start = text[..ns].chars().count();
+                                let c_end = text[..ne].chars().count();
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(c_start),
+                                    egui::text::CCursor::new(c_end),
+                                )));
+                                state.store(ui.ctx(), response.id);
+                            }
+                            return true;
+                        }
+                        rich_text::BubbleAction::FormatCode => {
+                            let (ns, ne) = rich_text::toggle_wrap(&mut text, b_start, b_end, "`", "`");
+                            set_block_text(block, text.clone());
+                            ui.data_mut(|d| d.insert_temp(sel_key, rich_text::SavedSelection::new(anchor_rect, ns, ne)));
+                            ui.ctx().memory_mut(|m| m.request_focus(response.id));
+                            if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), response.id) {
+                                let c_start = text[..ns].chars().count();
+                                let c_end = text[..ne].chars().count();
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(c_start),
+                                    egui::text::CCursor::new(c_end),
+                                )));
+                                state.store(ui.ctx(), response.id);
+                            }
+                            return true;
+                        }
+                        rich_text::BubbleAction::FormatLink => {
+                            let (ns, ne) = rich_text::toggle_wrap(&mut text, b_start, b_end, "[[", "]]");
+                            set_block_text(block, text.clone());
+                            ui.data_mut(|d| d.insert_temp(sel_key, rich_text::SavedSelection::new(anchor_rect, ns, ne)));
+                            ui.ctx().memory_mut(|m| m.request_focus(response.id));
+                            if let Some(mut state) = egui::text_edit::TextEditState::load(ui.ctx(), response.id) {
+                                let c_start = text[..ns].chars().count();
+                                let c_end = text[..ne].chars().count();
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(c_start),
+                                    egui::text::CCursor::new(c_end),
+                                )));
+                                state.store(ui.ctx(), response.id);
+                            }
+                            return true;
+                        }
+                        rich_text::BubbleAction::TransformBlock(t_name) => {
+                            let target = match t_name {
+                                "heading_1" => BlockKind::Heading,
+                                "heading_2" => BlockKind::Heading,
+                                "heading_3" => BlockKind::Heading,
+                                "todo_list" => BlockKind::Tasks,
+                                "callout" => BlockKind::Callout,
+                                "code_repl" => BlockKind::Code,
+                                _ => BlockKind::Text,
+                            };
+                            ui.data_mut(|d| d.remove_temp::<rich_text::SavedSelection>(sel_key));
+                            *op = Some(BlockOp::TransformTo(target));
+                            return true;
+                        }
+                    }
+                }
+            }
+
             if response.changed() {
+                // Smart prefix transform check:
+                if let Some(transform) = rich_text::detect_smart_transform(&text) {
+                    match transform {
+                        rich_text::SmartTransform::Heading(level, rest) => {
+                            block["type"] = json!("heading");
+                            block["data"] = json!({ "level": level, "text": rest });
+                            return true;
+                        }
+                        rich_text::SmartTransform::Tasks(rest) => {
+                            block["type"] = json!("todo_list");
+                            block["data"] = json!({
+                                "title": "",
+                                "items": [{ "id": "task_0", "text": rest, "done": false, "status": "todo" }]
+                            });
+                            return true;
+                        }
+                        rich_text::SmartTransform::Callout(rest) => {
+                            block["type"] = json!("callout");
+                            block["data"] = json!({
+                                "title": t(locale, Key::BlockCallout),
+                                "content": rest,
+                                "tone": "emerald"
+                            });
+                            return true;
+                        }
+                        rich_text::SmartTransform::Code(lang) => {
+                            block["type"] = json!("code_repl");
+                            block["data"] = json!({
+                                "language": if lang.is_empty() { "text" } else { &lang },
+                                "code": ""
+                            });
+                            return true;
+                        }
+                    }
+                }
+
                 set_block_text(block, text);
                 true
             } else {
@@ -4874,6 +5145,10 @@ fn draw_todo_block(ui: &mut Ui, block: &mut Value, locale: Locale) -> bool {
 
 fn draw_callout_block(ui: &mut Ui, block: &mut Value, locale: Locale) -> bool {
     let mut changed = false;
+    let block_id = block.get("id").and_then(Value::as_str).unwrap_or("callout").to_string();
+    let editing_id = ui.scope_id().with(("callout-editing", block_id));
+    let mut is_editing = ui.data(|d| d.get_temp(editing_id).unwrap_or(false));
+
     let tone = block
         .get("data")
         .and_then(|data| data.get("tone"))
@@ -4887,6 +5162,30 @@ fn draw_callout_block(ui: &mut Ui, block: &mut Value, locale: Locale) -> bool {
         _ => theme::ACCENT,
     };
 
+    let mut content = block
+        .get("data")
+        .and_then(|data| data.get("content"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            block
+                .get("data")
+                .and_then(|data| data.get("text"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("")
+        .to_string();
+
+    let mut title = block
+        .get("data")
+        .and_then(|data| data.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    if content.is_empty() && title.is_empty() {
+        is_editing = true;
+    }
+
     let inner = Frame::new()
         .fill(theme::WASH)
         .corner_radius(theme::RADIUS)
@@ -4897,53 +5196,136 @@ fn draw_callout_block(ui: &mut Ui, block: &mut Value, locale: Locale) -> bool {
             bottom: 11,
         })
         .show(ui, |ui| {
-            let mut title = block
-                .get("data")
-                .and_then(|data| data.get("title"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let title_response = ui.add(
-                TextEdit::singleline(&mut title)
-                    .font(FontId::new(13.5, theme::semibold()))
-                    .text_color(theme::INK)
-                    .frame(Frame::NONE)
-                    .margin(Margin::same(0))
-                    .desired_width(f32::INFINITY)
-                    .hint_text(t(locale, Key::BlockCallout)),
-            );
-            if title_response.changed() {
-                block["data"]["title"] = json!(title);
-                changed = true;
-            }
+            ui.horizontal(|ui| {
+                if is_editing {
+                    let title_response = ui.add(
+                        TextEdit::singleline(&mut title)
+                            .font(FontId::new(13.5, theme::semibold()))
+                            .text_color(theme::INK)
+                            .frame(Frame::NONE)
+                            .margin(Margin::same(0))
+                            .desired_width(ui.available_width() - 32.0)
+                            .hint_text(t(locale, Key::BlockCallout)),
+                    );
+                    if title_response.changed() {
+                        block["data"]["title"] = json!(title);
+                        changed = true;
+                    }
+                    if ghost(ui, Icon::Check, None, t(locale, Key::Done), true, 20.0).clicked() {
+                        is_editing = false;
+                        ui.data_mut(|d| d.insert_temp(editing_id, false));
+                    }
+                } else {
+                    if !title.is_empty() {
+                        ui.add(egui::Label::new(
+                            RichText::new(&title)
+                                .font(FontId::new(13.5, theme::semibold()))
+                                .color(tone_color),
+                        ));
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ghost(ui, Icon::Doc, None, t(locale, Key::EditNote), true, 20.0).clicked() {
+                            is_editing = true;
+                            ui.data_mut(|d| d.insert_temp(editing_id, true));
+                        }
+                    });
+                }
+            });
+
             ui.add_space(4.0);
 
-            let mut content = block
-                .get("data")
-                .and_then(|data| data.get("content"))
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    block
-                        .get("data")
-                        .and_then(|data| data.get("text"))
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or("")
-                .to_string();
-            let rows = content.lines().count().max(1);
-            let content_response = ui.add(
-                TextEdit::multiline(&mut content)
-                    .font(FontId::new(13.5, FontFamily::Proportional))
-                    .text_color(theme::MUTED)
-                    .frame(Frame::NONE)
-                    .margin(Margin::same(0))
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(rows)
-                    .hint_text("Write a note…"),
-            );
-            if content_response.changed() {
-                block["data"]["content"] = json!(content);
-                changed = true;
+            if is_editing {
+                let rows = content.lines().count().max(2);
+                let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap: f32| {
+                    links::layout(ui, buffer.as_str(), 13.5, wrap)
+                };
+                let content_response = ui.add(
+                    TextEdit::multiline(&mut content)
+                        .font(FontId::new(13.5, FontFamily::Proportional))
+                        .text_color(theme::MUTED)
+                        .frame(Frame::NONE)
+                        .margin(Margin::same(0))
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(rows)
+                        .layouter(&mut layouter)
+                        .hint_text("Write a note…"),
+                );
+                if content_response.changed() {
+                    block["data"]["content"] = json!(content);
+                    changed = true;
+                }
+            } else {
+                let wrap_width = ui.available_width();
+                let click_area = ui.vertical(|ui| {
+                    for line in content.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            ui.add_space(4.0);
+                            continue;
+                        }
+
+                        if trimmed.starts_with("### ") {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(&trimmed[4..])
+                                    .font(FontId::new(13.5, theme::semibold()))
+                                    .color(theme::INK),
+                            );
+                        } else if trimmed.starts_with("## ") {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(&trimmed[3..])
+                                    .font(FontId::new(15.0, theme::semibold()))
+                                    .color(theme::INK),
+                            );
+                        } else if trimmed.starts_with("# ") {
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new(&trimmed[2..])
+                                    .font(FontId::new(17.0, theme::semibold()))
+                                    .color(theme::INK),
+                            );
+                        } else if let Some(dot_pos) = trimmed.find(". ") {
+                            if trimmed[..dot_pos].chars().all(|c| c.is_ascii_digit()) && dot_pos <= 3 {
+                                let num = &trimmed[..dot_pos];
+                                let rest = trimmed[dot_pos + 2..].trim();
+                                ui.horizontal(|ui| {
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        RichText::new(format!("{num}."))
+                                            .font(FontId::new(11.5, theme::mono()))
+                                            .color(tone_color),
+                                    );
+                                    let galley = links::layout(ui, rest, 13.0, wrap_width - 24.0);
+                                    ui.label(galley);
+                                });
+                            } else {
+                                let galley = links::layout(ui, line, 13.0, wrap_width);
+                                ui.label(galley);
+                            }
+                        } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                            let rest = trimmed[2..].trim();
+                            ui.horizontal(|ui| {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("•")
+                                        .font(FontId::new(13.0, theme::semibold()))
+                                        .color(tone_color),
+                                );
+                                let galley = links::layout(ui, rest, 13.0, wrap_width - 20.0);
+                                ui.label(galley);
+                            });
+                        } else {
+                            let galley = links::layout(ui, line, 13.0, wrap_width);
+                            ui.label(galley);
+                        }
+                    }
+                }).response.interact(Sense::click());
+
+                if click_area.double_clicked() {
+                    is_editing = true;
+                    ui.data_mut(|d| d.insert_temp(editing_id, true));
+                }
             }
         });
 
